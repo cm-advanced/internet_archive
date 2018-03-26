@@ -1,0 +1,12 @@
+name = CMA Internet Archive
+package = Community Media Advanced
+dependencies[] = 'views'
+dependencies[] = 'views_bulk_operations'
+description = Provides integration between Drupal files and Archive.org
+
+core = 7.x
+version = "7.x-2.1"
+project = "internet_archive"
+configure = admin/config/internet_archive
+
+project_status_url = https://github.com/cm-advanced/internet_archive

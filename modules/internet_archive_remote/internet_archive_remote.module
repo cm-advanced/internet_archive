@@ -1,0 +1,232 @@
+<?php
+
+/**
+ * Implements hook_menu().
+ */
+function internet_archive_remote_menu() {
+  $items['admin/config/internet_archive/remote'] = array(
+    'title' => 'Remote Settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('internet_archive_remote_admin_form'),
+    'access arguments' => array('administer internet_archive'),
+    'weight' => 15,
+  );
+
+  return $items;
+}
+
+/**
+ * Form builder for the internet archive om metadata site settings form.
+ *
+ * @ingroup forms
+ */
+function internet_archive_remote_admin_form($form, &$form_state) {
+  $message = internet_archive_remote_test_connection();
+  if ($message == 'archive-server-authenticated') {
+    $status = '<div style="background-color:PaleGreen; padding:5px;">' .
+      '<strong>Connection Test: Passed :)</strong></div>';
+  }
+  else {
+    $status = '<div style="background-color:Khaki; padding:5px;">'.
+      '<strong>Connection Test: Failed :(</strong><br /> Reason: ' . $message .
+      '</div>';
+  }
+
+  $form['internet_archive']['internet_archive_remote_test'] = array(
+    '#markup' => $status,
+  );
+
+  $description =
+    t("Select the fields you would like to interact with Archive.org. These ".
+      "fields will expect to find the data file on a remote server.");
+  
+  $form['internet_archive']['internet_archive_fields_remote'] =
+    array(
+	  '#type' => 'select',
+	  '#description' => $description,
+	  '#title' => t('Include the following fields as remote file sources'),
+	  '#default_value' =>
+	  variable_get('internet_archive_fields_remote', FALSE),
+	  '#options' => internet_archive_field_select_options(),
+	  '#multiple' => TRUE,
+	  );
+
+  $form['internet_archive']['internet_archive_server_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('URL to internet_archive_server.wsdl'),
+    '#default_value' => variable_get('internet_archive_server_url', FALSE),
+    '#description' =>
+    t("Enter the URL to the internet_archive_server.wsdl file, ex: ".
+      "http://www.yoursite.com/internet_archive/internet_archive_server.wsdl"),
+    '#required' => TRUE,
+  );
+  $form['internet_archive']['internet_archive_remote_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Access key set in internet_archive_server.php'),
+    '#default_value' => variable_get('internet_archive_remote_key', FALSE),
+    '#description' =>
+    t("This key is used to authenticate with the remote server."),
+    '#required' => TRUE,
+  );
+  $form['internet_archive']['internet_archive_harvest_remote'] = array(
+    '#type' => 'checkbox',
+    '#title' =>
+    t('Grab files from the remote directory and save them to nodes/entities'),
+    '#default_value' => variable_get('internet_archive_harvest_remote', FALSE),
+    '#description' =>
+    t("You will need to override hook_internet_archive_process_remote_files ".
+      "to determine what entity/node fields to save the file name to."),
+  );
+  $form['internet_archive']['internet_archive_remote_prefix'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Prepend text to the beginning of stored paths'),
+    '#default_value' => variable_get('internet_archive_remote_prefix', FALSE),
+    '#description' => t("Prepend text to the beginning of stored paths"),
+  );
+  $form['internet_archive']['internet_archive_remote_append'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Append text to the end of stored paths'),
+    '#default_value' => variable_get('internet_archive_remote_append', FALSE),
+    '#description' => t("Append text to the end of stored paths"),
+  );
+
+    $description =
+      t('Sometimes SOAP connections to the remote server are unexpectedly ' .
+	'terminated. Sometimes those connections are cut after the remote '.
+	'server begins to upload the remote file and the file actually ends '.
+	'up uploading successfully. When we catch the connection termination '.
+	'exception, we set the status to ARCHIVE_TRANSFERRING,  and later '.
+	'cron runs will try to validate and derive the transfer. This '.
+	'setting will say how long in HOURS  we should continue to check ' .
+	'before we mark it ARCHIVE_FAILED and reharvest it into the queue.');
+  
+  $form['internet_archive']['internet_archive_remote_allowed_upload_time'] =
+    array(
+	  '#type' => 'textfield',
+	  '#title' => t('Allowed Upload Time (Hours)'),
+	  '#default_value' =>
+	  variable_get('internet_archive_remote_allowed_upload_time', 24),
+	  '#description' => $description,
+	  '#size' => 5,
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function internet_archive_remote_new_client() {
+  //TODO: remove when done testing
+  ini_set("soap.wsdl_cache_enabled", "0"); // disabling WSDL cache
+
+  //Get the location of the external wsdl file
+  $soap_url = variable_get('internet_archive_server_url', NULL);
+
+  //Initialize our SOAP client
+  try {
+    $client = new SoapClient($soap_url);
+  }
+  catch (Exception $e) {
+    return $e->getMessage();
+  }
+
+  //Build header, including MD5 hash of token
+  $key = md5(variable_get('internet_archive_remote_key', FALSE));
+  $header = new SoapHeader('http://github.com/cm-advancd/internet_archive',
+			   'token-' . $key);
+  $client->__setSoapHeaders($header);
+
+  return $client;
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function internet_archive_remote_test_connection() {
+  $client = internet_archive_remote_new_client();
+  if (!is_object($client)) {
+    //return the error message
+    return $client;
+  }
+
+  $response = $client->testConnection();
+
+  return $response;
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function internet_archive_remote_put_object($file_name, $bucket, $uri,
+					    $headers, $mimetype) {
+  ini_set('default_socket_timeout',-1);
+  $prefix = variable_get('internet_archive_remote_prefix', FALSE);
+  $append = variable_get('internet_archive_remote_append', FALSE);
+  $remote_file_name = $prefix . $file_name . $append;
+  $settings = array(
+    'filepath' => $remote_file_name,
+    'bucket' => $bucket,
+    'uri' => $uri,
+    'headers' => $headers,
+    'mimetype' => $mimetype,
+    'skey' => variable_get('internet_archive_skey', NULL),
+    'key' => variable_get('internet_archive_key', NULL),
+  );
+
+  $client = internet_archive_remote_new_client();
+  try {
+    $response = $client->putObject(serialize($settings));
+  }
+  catch (Exception $e) {
+    drupal_set_message("SOAP Connection died while uploading " . $file_name .
+		       " due to: " . $e->getMessage(), 'error');
+    return FALSE;    
+  }
+  return TRUE;
+}
+
+/**
+ * IMPLEMENTS hook_internet_archive_harvest_remote_files()
+ *
+ * Will use remote settings to find all the files on the remote server and
+ * then invoke a hook to allow other modules to define what to do with those
+ * files, i.e. what what node and what field to put them on
+ */
+function internet_archive_remote_internet_archive_harvest_remote_files() {
+
+  if (!variable_get('internet_archive_harvest_remote', FALSE)) {
+    return;
+  }
+
+  //build url to the files directory
+  $prefix = variable_get('internet_archive_remote_prefix', FALSE);
+  $remote_url = variable_get('internet_archive_server_url', FALSE);
+  if (!$remote_url) {
+    return;
+  }
+  
+  $url_parts = parse_url($remote_url);
+  $remote_file_directory_url = "http://" . $url_parts['host'] . '/' . $prefix;
+
+  //grab all file names from directory
+  $html = file_get_contents($remote_file_directory_url);
+  //parse the html
+  $count = preg_match_all('/<a href=\"([^\"]*)\">(.*)<\/a>/iU',
+			  $html, $files);
+
+  //for each file name invoke the hook to store on a entity/node
+  for ($i = 0; $i < $count; ++$i) {
+    $file = $files[1][$i];
+    if (ctype_alnum(substr($file, 0, 1))){
+      $harvested_files[] = $file;
+    } 
+  }
+  if ($harvested_files) {
+    module_invoke_all('internet_archive_process_remote',
+		      $harvested_files);
+  }
+}

@@ -1,0 +1,564 @@
+<?php
+/**
+ * @file
+ * Provides integration between Drupal files and Archive.org.
+ *
+ */
+
+/**
+ * File status in regards to Archive.org
+ */
+define('ARCHIVE_QUEUED', 'queued');
+define('ARCHIVE_TRANSFERRING', 'transferring');
+define('ARCHIVE_TRANSFERRED', 'transferred');
+define('ARCHIVE_VALIDATED', 'validated');
+define('ARCHIVE_DERIVED', 'derived');
+define('ARCHIVE_DELETED', 'deleted');
+define('ARCHIVE_FAILED', 'failed');
+
+define('ARCHIVE_FILE_LOCATION_REMOTE','remote');
+define('ARCHIVE_FILE_LOCATION_LOCAL','local');
+
+/**
+ * Log table status levels
+ */
+define('ARCHIVE_LOG_ERROR', 1);
+define('ARCHIVE_LOG_WARNING', 2);
+define('ARCHIVE_LOG_NOTICE', 3);
+
+/** 
+ * Implements hook_init()
+ */
+function internet_archive_init() {
+
+  //first load the class file for the S3 class that talks with archive.org
+  $status =
+    module_load_include('php', 'internet_archive', 'includes/archive_s3');
+
+  //load all the module include files, most of code is in here
+  $includes = array(
+		    'archive_util',
+		    'cron',
+		    'misc',
+		    'node',
+		    'queue',
+		    'reports',
+		    'settings_form',
+		    'views_helper',
+		    );
+
+  foreach($includes as $inc) {
+    $status =
+      module_load_include('inc', 'internet_archive', 'includes/'.$inc);
+  }
+}
+/**
+ * Implements hook_menu().
+ */
+function internet_archive_menu() {
+  // Main settings pages
+  $items['admin/config/internet_archive'] =
+    array(
+	  'title' => 'Internet Archive',
+	  'description' =>
+	  t('Configure how files are transferred to Archive.org'),
+	  'page callback' => 'internet_archive_settings_home',
+	  'access arguments' => array('administer internet_archive'),
+	  'type' => MENU_NORMAL_ITEM,
+	  );
+  $items['admin/config/internet_archive/default'] =
+    array(
+	  'title' => 'Default Settings',
+	  'page callback' => 'drupal_get_form',
+	  'page arguments' => array('internet_archive_admin_form'),
+	  'access arguments' => array('administer internet_archive'),
+	  'weight' => -3,
+	  );
+
+    $items['admin/config/internet_archive/queue'] =
+      array(
+	    'title' => 'Queue Settings',
+	    'page callback' => 'drupal_get_form',
+	    'page arguments' => array('internet_archive_queue_settings_form'),
+	    'access arguments' => array('administer internet_archive'),
+	    'weight' => 0,
+	    );
+    
+    // report and log views
+    $items['admin/reports/internet_archive'] =
+      array(
+	    'title' => 'Internet Archive Log',
+	    'description' => t('View the file transfer log and statistics'),
+	    'page callback' => 'internet_archive_reports_home',
+	    'access arguments' => array('administer internet_archive'),
+	    'type' => MENU_NORMAL_ITEM,
+	    );
+    $items['admin/reports/internet_archive/default'] =
+      array(
+	    'title' => 'Queue',
+	    'page callback' => 'internet_archive_reports_log',
+	    'access arguments' => array('administer internet_archive'),
+	    'type' => MENU_DEFAULT_LOCAL_TASK,
+	    'weight' => -3,
+	    );
+  $items['admin/reports/internet_archive/log'] =
+    array(
+	  'title' => 'System Messages',
+	  'page callback' => 'internet_archive_reports_system_messages',
+	  'access arguments' => array('administer internet_archive'),
+	  'type' => MENU_LOCAL_TASK,
+	  'weight' => 55,
+	  );
+  $items['admin/reports/internet_archive/stats'] =
+    array(
+	  'title' => 'Statistics',
+	  'page callback' => 'internet_archive_reports_statistics',
+	  'access arguments' => array('administer internet_archive'),
+	  'type' => MENU_LOCAL_TASK,
+	  'weight' => 50,
+	  );
+  $items['admin/reports/internet_archive'] =
+    array(
+	  'title' => 'Internet Archive Reports and Tools',
+	  'description' =>t('View Reports and tools for Queues and Transfers'),
+	  'page callback' => 'internet_archive_queues_home',
+	  'access arguments' => array('administer internet_archive'),
+	  'type' => MENU_NORMAL_ITEM,
+	  );
+  
+  $items['admin/structure/internet_archive/default'] =
+    array(
+	  'title' => 'Upload Queue',
+	  'page callback' => 'drupal_get_form',
+	  'page arguments' => array('internet_archive_queue_admin_form'),
+	  'access arguments' => array('administer internet_archive'),
+	  'file' => 'includes/internet_archive_queue.inc',
+	  'type' => MENU_DEFAULT_LOCAL_TASK,
+	  'weight' => -1,
+	  );
+  //manual file and node based commands
+  $items['internet_archive/%/transfer'] =
+    array(
+	  'title' => 'Confirm File Transfer to Archive.org',
+	  'page callback' => 'drupal_get_form',
+	  'access arguments' => array('administer internet_archive'),
+	  'page arguments' => array('internet_archive_transfer_confirm', 1),
+	  );
+  $items['node/%node/ia'] =
+    array(
+	  'title' => 'Internet Archive',
+	  'page callback' => internet_archive_node_status,
+	  'page arguments' => array(1),
+	  //'access arguments' => array('administer internet_archive'),
+	  'access callback' => internet_archive_tab_permission,
+	  'access arguments' => array(1),
+	  'type' => MENU_LOCAL_TASK,
+	  'weight' => 10,
+	  );
+  $items['node/%node/ia/update-metadata'] =
+    array(
+	  'title' => 'Internet Archive Metadata Update',
+	  'page callback' => internet_archive_update_node_metadata,
+	  'page arguments' => array(1),
+	  'access callback' =>internet_archive_update_node_metadata_permission,
+	  'access arguments' => array(1),
+	  'type' => MENU_CALLBACK,
+	  'weight' => 10,
+  );
+  $items['node/%node/ia/delete-files'] =
+    array(
+	  'title' => 'Internet Archive Metadata Delete',
+	  'page callback' => internet_archive_delete_node_files,
+	  'page arguments' => array(1, 4),
+	  'access callback' => internet_archive_delete_node_files_permission,
+	  'access arguments' => array(1),
+	  'type' => MENU_CALLBACK,
+	  'weight' => 10,
+	  );
+  $items['ia/log'] =
+    array(
+	  'title' => 'Internet Archive File Log',
+	  'page callback' => internet_archive_log_view,
+	  'page arguments' => array('tid', 2),
+	  'access arguments' => array('access internet_archive logs'),
+	  'type' => MENU_CALLBACK,
+	  'weight' => 11,
+	  );
+  $items['ia/transfer'] =
+    array(
+	  'title' => 'Transfer Item Out of Queue',
+	  'page callback' => 'internet_archive_transfer_item_out_of_queue',
+	  'page arguments' => array(2),
+	  'access arguments' => array('administer internet_archive'),
+	  'type' => MENU_LOCAL_TASK,
+	  'weight' => 11,
+	  );
+  $items['ia/validate'] =
+    array(
+	  'title' => 'Validate and Derive Archive Item',
+	  'page callback' => 'internet_archive_validate_and_derive',
+	  'page arguments' => array(2),
+	  'access arguments' => array('administer internet_archive'),
+	  'type' => MENU_LOCAL_TASK,
+	  'weight' => 11,
+	  );
+
+  return $items;
+}
+/**
+ * Implements hook_permission().
+ * Note: this function has to be in module file, it can't be in an include file
+ */
+function internet_archive_permission() {
+  return array(
+    'administer internet_archive' => array(
+      'title' => t('administer internet_archive'),
+      'description' =>
+      t('TODO Add a description for \'administer internet_archive\''),
+    ),
+    'access all internet_archive node tabs' => array(
+      'title' => t('access all internet_archive node tabs'),
+      'description' =>
+      t("TODO Add a description for 'access all internet_archive node tabs'"),
+    ),
+    'access own internet_archive node tabs' => array(
+      'title' => t('access own internet_archive node tabs'),
+      'description' =>
+      t("TODO Add a description for 'access own internet_archive node tabs'"),
+    ),
+    'update all internet_archive metadata' => array(
+      'title' => t('update all internet_archive metadata'),
+      'description' =>
+      t('TODO Add a description for \'update all internet_archive metadata\''),
+    ),
+    'update own internet_archive metadata' => array(
+      'title' => t('update own internet_archive metadata'),
+      'description' =>
+      t('TODO Add a description for \'update own internet_archive metadata\''),
+    ),
+    'access internet_archive logs' => array(
+      'title' => t('access internet_archive logs'),
+      'description' =>
+      t('TODO Add a description for \'access internet_archive logs\''),
+    ),
+    'delete all internet_archive files' => array(
+      'title' => t('delete all internet_archive files'),
+      'description' =>
+      t('TODO Add a description for \'delete all internet_archive files\''),
+    ),
+    'delete own internet_archive files' => array(
+      'title' => t('delete own internet_archive files'),
+      'description' =>
+      t('TODO Add a description for \'delete own internet_archive files\''),
+    ),
+  );
+}
+
+
+/**
+ * This function determines who and when the Internet Archive tab appears
+ * Note: this function has to be in module file, it can't be in an include file
+ */
+function internet_archive_tab_permission($node) {
+  internet_archive_init();
+  global $user;
+  if (user_access('access all internet_archive node tabs') ||
+      (user_access('access own internet_archive node tabs') &&
+       $user->uid == $node->uid)) {
+    if ($node_fields = internet_archive_node_fields($node)) {
+      return TRUE;
+    }
+  }
+  else {
+    return FALSE;
+  }
+}
+
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ * Note: this function has to be in module file, it can't be in an include file
+ */
+function internet_archive_update_node_metadata_permission($node) {
+  internet_archive_init();
+  global $user;
+  if (user_access('update all internet_archive metadata') ||
+      (user_access('update own internet_archive metadata') &&
+       $user->uid == $node->uid)) {
+    if ($files = internet_archive_node_files($node->nid)) {
+      return TRUE;
+    }
+  }
+  else {
+    return FALSE;
+  }
+}
+
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ * Note: this function has to be in module file, it can't be in an include file
+ */
+function internet_archive_delete_node_files_permission($node) {
+  internet_archive_init();
+  global $user;
+  if (user_access('delete all internet_archive files') ||
+      (user_access('delete own internet_archive files') &&
+       $user->uid == $node->uid)) {
+    if ($files = internet_archive_node_files($node->nid)) {
+      return TRUE;
+    }
+  }
+  else {
+    return FALSE;
+  }
+}
+
+
+/////////////////////////////////////////////////////////////////////////
+//VIEWS RELATED FUNCTION THAT NEED TO BE IN THIS FILE RATHER THAN INCLUDE
+//
+//FOR MORE VIEWS FUNCTION GO TO internet_archive/includes/views_helper.inc
+
+/**
+ * Implements hook_views_api().
+ * @return Array with Views API version.
+ * Note: this function has to be in module file, it can't be in an include file
+ */
+function internet_archive_views_api() {
+  return array(
+	       'api' => 3,
+	       'path' => 
+	       drupal_get_path('module', 
+			       'internet_archive').'/includes'
+	       );
+}
+
+/**
+ * Implements hook_views_data().
+ * @return Array with Views table information.
+ * Note: this function has to be in module file, it can't be in an include file
+ */
+function internet_archive_views_data() {
+  $data['internet_archive']['table']['group'] = t('Internet Archive');
+
+  $data['internet_archive']['table']['base'] = array(
+    'field' => 'tid',
+    'title' => t('Internet Archive'),
+    'help' => t("Information regarding files transferred to Archive.org"),
+    'weight' => -10,
+  );
+
+  $data['internet_archive']['table']['join'] = array(
+    'node' => array(
+      'left_field' => 'nid',
+      'field' => 'nid',
+    ),
+  );
+
+  $data['internet_archive']['tid'] = array(
+    'title' => t('Transfer ID'),
+    // The help that appears on the UI,
+    'help' => t('Numeric ID unique to each archive.org transfer'), 
+    // Information for displaying the nid
+    'field' => array(
+      'handler' => 'views_handler_field_numeric',
+      'click sortable' => TRUE,
+    ),
+    'sort' => array(
+      'handler' => 'views_handler_sort',
+    ),
+    'filter' => array(
+      'handler' => 'views_handler_filter_numeric',
+    ),
+  );
+  $data['internet_archive']['nid'] = array(
+    'title' => t('Node ID'),
+    'help' => t('Origin node of the file'), 
+    // Information for displaying the nid
+    'relationship' => array(
+      'label' => t('Node'),
+      'base' => 'node',
+      'base field' => 'nid',
+    ),
+    'field' => array(
+      'handler' => 'views_handler_field_numeric',
+      'click sortable' => TRUE,
+    ),
+    'sort' => array(
+      'handler' => 'views_handler_sort',
+    ),
+    'filter' => array(
+      'handler' => 'views_handler_filter_numeric',
+    ),
+  );
+  $data['internet_archive']['in_path'] = array(
+    'title' => t('Source Path'),
+    'help' => t('Path to file transferred to archive.org'), 
+    'relationship' => array(
+      'label' => t('Files'),
+      'base' => 'files',
+      'base field' => 'file_name',
+    ),
+    // Information for displaying the nid
+    'field' => array(
+      'handler' => 'views_handler_field',
+      'click sortable' => TRUE,
+    ),
+    'sort' => array(
+      'handler' => 'views_handler_sort',
+    ),
+    'filter' => array(
+      'handler' => 'views_handler_filter_string',
+    ),
+  );
+  $data['internet_archive']['archive_url'] = array(
+    'title' => t('Archive.org URL'),
+    'help' => t('URL to file on Archive.org'), 
+    // Information for displaying the nid
+    'field' => array(
+      'handler' => 'views_handler_field_url',
+      'click sortable' => TRUE,
+    ),
+    'sort' => array(
+      'handler' => 'views_handler_sort',
+    ),
+    'filter' => array(
+      'handler' => 'views_handler_filter_string',
+    ),
+  );
+  $data['internet_archive']['file_name'] = array(
+    'title' => t('File Name'),
+    'help' => t('Source file_name'), // The help that appears on the UI,
+    // Information for displaying the nid
+    'field' => array(
+      'handler' => 'views_handler_field',
+      'click sortable' => TRUE,
+    ),
+    'sort' => array(
+      'handler' => 'views_handler_sort',
+    ),
+    'filter' => array(
+      'handler' => 'views_handler_filter_string',
+    ),
+  );
+  $data['internet_archive']['field_name'] = array(
+    'title' => t('Field Name'),
+    'help' => t('Name of the Drupal Field'),
+    // Information for displaying the nid
+    'field' => array(
+      'handler' => 'views_handler_field',
+      'click sortable' => TRUE,
+    ),
+    'sort' => array(
+      'handler' => 'views_handler_sort',
+    ),
+    'filter' => array(
+      'handler' => 'views_handler_filter_string',
+    ),
+  );
+  $data['internet_archive']['file_location'] = array(
+    'title' => t('File Location'),
+    'help' => t('Location of file, local or remote'), 
+    // Information for displaying the nid
+    'field' => array(
+		     'handler' => 'views_handler_field',
+      'click sortable' => TRUE,
+    ),
+    'sort' => array(
+      'handler' => 'views_handler_sort',
+    ),
+    'filter' => array(
+      'handler' => 'views_handler_filter_string',
+    ),
+  );
+
+  $data['internet_archive']['md5'] = array(
+    'title' => t('MD5 Hash'),
+    'help' => t('MD5 Hash of the file sent to Archive.org'), 
+    // Information for displaying the nid
+    'field' => array(
+      'handler' => 'views_handler_field',
+      'click sortable' => TRUE,
+    ),
+    'sort' => array(
+      'handler' => 'views_handler_sort',
+    ),
+    'filter' => array(
+      'handler' => 'views_handler_filter_string',
+    ),
+  );
+  $data['internet_archive']['item'] = array(
+    'title' => t('Item Identifier'),
+    'help' => t('Item/Bucket name of the resource on archive.org'), 
+    // Information for displaying the nid
+    'field' => array(
+      'handler' => 'views_handler_field',
+      'click sortable' => TRUE,
+    ),
+    'sort' => array(
+      'handler' => 'views_handler_sort',
+    ),
+    'filter' => array(
+      'handler' => 'views_handler_filter_string',
+    ),
+  );
+  $data['internet_archive']['status'] = array(
+    'title' => t('Transfer Status'),
+    'help' => t('Status of the transfer to archive.org'), 
+    // Information for displaying the nid
+    'field' => array(
+      'handler' => 'views_handler_field',
+      'click sortable' => TRUE,
+    ),
+    'sort' => array(
+      'handler' => 'views_handler_sort',
+    ),
+    'filter' => array(
+      'handler' => 'views_handler_filter_string',
+    ),
+  );
+  $data['internet_archive']['date'] = array(
+    'title' => t('Date Archived'),
+    'help' => t('Date the transfer was initiated to archive.org'), 
+    // Information for displaying the nid
+    'field' => array(
+      'handler' => 'views_handler_field_date',
+      'click sortable' => TRUE,
+    ),
+    'sort' => array(
+      'handler' => 'views_handler_sort',
+    ),
+    'filter' => array(
+      'handler' => 'views_handler_filter_date',
+    ),
+  );
+  return $data;
+}
+
+/**
+ * Implements hook_field_formatter_info().
+ * 
+ * Note: this function has to be in module file, it can't be in an include file
+ */
+function internet_archive_field_formatter_info() {
+  return array(
+    'internet_archive_video_embed' => array(
+      'label' => t('Internet Archive Video Embed'),
+      'field types' => array('file',  'text'),
+      'description' => t('Displays video embed code from archive.org.'),
+      'settings' => array('archive_links', 'show',
+			  'archive_embed_width', 470,
+			  'archive_embed_height', 371,
+			  ),
+    ),
+    'internet_archive_thumbnail' => array(
+      'label' => t('Internet Archive Thumbnail'),
+      'field types' => array('file',  'text'),
+      'description' => t('Displays thumbnail from archive.org.'),
+      'settings' => array('archive_links', 'show'),
+    ),
+  );
+}
